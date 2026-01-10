@@ -1,0 +1,794 @@
+---
+title: "CAMCAN_cog"
+author: "Josefina Weinerova"
+date: "2025-09-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#packages
+```{r}
+if (!require(pacman)) install.packages("pacman")
+
+pacman::p_load(lmerTest, tidyverse, effectsize, Rmisc, cowplot, broom.mixed,purrr, dplyr,openxlsx)
+```
+#load data (data available from the CamCAN team: https://cam-can.mrc-cbu.cam.ac.uk/dataset/)
+
+```{r}
+df <- read_csv("CamCAN_demographic_cognitive_COVID_P1_P4_P5.csv")
+covid_q <- read_csv("just_covid_answers_2.csv")
+```
+#Exclusion criteria
+```{r}
+df$CC.ID <- as.factor(df$CC.ID)
+df <- df %>%
+  group_by(CC.ID) %>%
+  fill(covid_question, .direction = "downup") %>% # fill down, then up within each participant
+  ungroup()
+df <- df %>% filter(covid_question == "No" | covid_question == "Yes, confirmed by a positive test")
+df <- df %>% mutate(covid_group = as.integer(covid_question == "Yes, confirmed by a positive test"))
+```
+#df pre-processing
+```{r}
+df$covid_group <- as.factor(df$covid_group)
+df <- df %>%
+  mutate(wave = str_remove_all(wave, "\\s+"))
+# removal of outliers
+
+df_wide <- df %>%
+  pivot_wider(
+    id_cols = CC.ID,
+    names_from = wave, 
+    values_from = c(
+      story_memory_immediate_score,
+      story_memory_delayed_score,
+      cattell_total_score,
+      acer_score,
+      stw_n_correct_trials 
+    ),
+    names_glue = "{.value}_{wave}" # new names: <original>_<wave>
+  )
+
+colnames(df_wide)
+df_wide <- df_wide %>% select(-c("story_memory_immediate_score_Phase4", "story_memory_delayed_score_Phase4"))
+
+df_wide$story_mem_immed_dif <- df_wide$story_memory_immediate_score_Phase5 - df_wide$`story_memory_immediate_score_Phase1/2`
+df_wide$story_mem_del_dif <- df_wide$story_memory_delayed_score_Phase5 - df_wide$`story_memory_delayed_score_Phase1/2`
+```
+
+# Removing outliers
+- calculates difference scores and then removes values that have difference scores that are 3x IQR above or below third and first quartile
+
+```{r}
+# removing outliers
+outliers <- function(variable) {
+  iqr <- IQR(variable, na.rm = TRUE)
+  Q <- quantile(variable, probs = c(.25, .75), na.rm = TRUE)
+  mild_low <- Q[1] - (3 * iqr)
+  mild_high <- Q[2] + (3 * iqr)
+  new_variable <- ifelse(variable < mild_low | variable > mild_high, NA, variable)
+  return(new_variable)
+}
+
+# NA numbers
+df_wide %>%
+  dplyr::summarise(across(everything(), ~ sum(is.na(.))))
+# creating difs columns
+# Long: gather all columns ending with _Phase1/2, _Phase4, _Phase5
+long <- df_wide %>%
+  pivot_longer(
+    cols = matches("_Phase(1/2|4|5)$"),
+    names_to = c("var", "phase"),
+    names_pattern = "^(.*)_Phase(1/2|4|5)$",
+    values_to = "value"
+  ) %>%
+  mutate(phase = recode(phase, "1/2" = "12")) # avoid slash in names
+
+# Compute diffs per participant & variable, then wide df
+diffs <- long %>%
+  select(CC.ID, var, phase, value) %>%
+  pivot_wider(names_from = phase, values_from = value) %>% 
+  mutate(
+    dif1 = `5` - `4`, # Phase5 − Phase4
+    dif2 = `5` - `12` # Phase5 − Phase1/2
+  ) %>%
+  select(CC.ID, var, dif1, dif2) %>%
+  pivot_wider(
+    id_cols = CC.ID,
+    names_from = var,
+    values_from = c(dif1, dif2),
+    names_glue = "{var}_{.value}" 
+  )
+
+# attach back to original data
+df2 <- df_wide %>% left_join(diffs, by = "CC.ID")
+
+cols_difs <- c("story_memory_immediate_score_dif1", "story_memory_delayed_score_dif1", "cattell_total_score_dif1", "acer_score_dif1", "stw_n_correct_trials_dif1", "story_memory_immediate_score_dif2", "story_memory_delayed_score_dif2", "cattell_total_score_dif2", "acer_score_dif2", "stw_n_correct_trials_dif2")
+
+na_pre <- colSums(is.na(df2))
+# removing outliers
+df2[cols_difs] <- sapply(df2[cols_difs], outliers) # applying outlier removal
+
+na_post <- colSums(is.na(df2))
+#check numbers pre and post removal
+na_pre
+na_post
+```
+# original columns NA if the difference is NA
+```{r}
+# List of test names for those that have 3 instances
+test_names <- cols <- c(
+  "cattell_total_score",
+  "stw_n_correct_trials"
+)
+
+# Loop over each test and replace T1 and T2 with NA where the difference is NA
+for (test in test_names) {
+  diff_col1 <- paste0(test, "_dif1")
+  diff_col2 <- paste0(test, "_dif2") # Difference column
+  t1_col <- paste0(test, "_Phase1/2") # Time 1 column
+  t2_col <- paste0(test, "_Phase4")
+  t3_col <- paste0(test, "_Phase5") # Time 2 column
+
+  # Set T1 and T2 to NA where the difference column is NA
+  df2[[t1_col]][is.na(df2[[diff_col1]])] <- NA
+  df2[[t2_col]][is.na(df2[[diff_col1]])] <- NA
+  df2[[t3_col]][is.na(df2[[diff_col1]])] <- NA
+  df2[[t1_col]][is.na(df2[[diff_col2]])] <- NA
+  df2[[t2_col]][is.na(df2[[diff_col2]])] <- NA
+  df2[[t3_col]][is.na(df2[[diff_col2]])] <- NA
+}
+#tests with 2 instances
+test_names <- cols <- c(
+  "story_memory_delayed_score",
+  "story_memory_immediate_score",
+  "acer_score"
+)
+
+# Loop over each test and replace T1 and T2 with NA where the difference is NA
+for (test in test_names) {
+  diff_col2 <- paste0(test, "_dif2") # Difference column
+  t1_col <- paste0(test, "_Phase1/2") # Time 1 column
+  t3_col <- paste0(test, "_Phase5") # Time 3 column
+
+  # Set T1 and T2 to NA where the difference column is NA
+  df2[[t1_col]][is.na(df2[[diff_col2]])] <- NA
+  df2[[t3_col]][is.na(df2[[diff_col2]])] <- NA
+}
+
+View(df2)
+colSums(!is.na(df2))
+```
+# demographics saving in another df
+
+```{r}
+colnames(df)
+demo <- df %>% dplyr::select("CC.ID", "wave", "sex", "dob", "sex", "ethnic_group", "total_household_incomeP1", "total_household_incomeP5", "num_years_edu", "covid_question", "stw_age", "stw_date", "acer_age", "acer_date", "story_memory_age", "story_memory_date", "cattell_age", "cattell_date", "covid_group")
+
+
+## LONG df
+df_long <- df2 %>%
+  select(CC.ID, matches("_Phase")) %>%
+  pivot_longer(
+    cols = -CC.ID,
+    names_to = c("measure", "wave"), # wave keeps "Phase1/2", "Phase4", "Phase5", ...
+    names_pattern = "^(.*)_(Phase.+)$",
+    values_to = "value"
+  ) %>%
+  select(CC.ID, wave, measure, value)
+
+## WIDE df (each measure becomes its own column)
+df_long <- df_long %>%
+  pivot_wider(
+    names_from  = measure,
+    values_from = value
+  )
+#merge with demographics
+df_A <- merge(df_long, demo, by = c("CC.ID", "wave"))
+str(df_A)
+df_A <- df_A %>% mutate(
+  across(where(is.character), ~ na_if(., "<NA>"))
+)
+#ethnicity binary variable
+df_A$eth2 <- ifelse(df_A$ethnic_group == "White", "white", "other")
+```
+
+# memory analysis
+
+```{r}
+# subselect relevant columns
+mem_im_data <- df_A %>% select(CC.ID, wave, story_memory_immediate_score, story_memory_delayed_score, covid_group, sex, ethnic_group, num_years_edu, story_memory_age, story_memory_date, eth2)
+dates_wide <- mem_im_data %>%
+  select(CC.ID, wave, story_memory_date) %>%
+  distinct() %>% # in case of duplicates
+  pivot_wider(
+    names_from = wave, # e.g. "Phase1/2", "Phase4", ...
+    values_from = story_memory_date,
+    names_prefix = "story_memory_date_" # columns like story_memory_date_Phase1/2
+  )
+# calculate months difs between testing
+mem_im_data <- mem_im_data %>%
+  select(-story_memory_date) %>%
+  left_join(dates_wide, by = "CC.ID")
+mem_im_data <- mem_im_data %>%
+  mutate(
+    d_start = as.Date(`story_memory_date_Phase1/2`),
+    d_end = as.Date(story_memory_date_Phase5),
+    month_dif = time_length(interval(d_start, d_end), "months") # fractional
+  )
+
+mem_im_data %>%
+  filter(wave == "Phase5") %>%
+  filter(covid_group == 0) %>%
+  summary()
+
+mem_im_data$month_dif_sq <- mem_im_data$month_dif^2
+# calculate age at T2
+mem_im_data <- mem_im_data %>%
+  dplyr::group_by(CC.ID) %>%
+  dplyr::mutate(age2 = max(story_memory_age, na.rm = TRUE)) %>%
+  ungroup()
+# check data types
+str(mem_im_data)
+mem_im_data$sex <- as.factor(mem_im_data$sex)
+mem_im_data$wave <- as.factor(mem_im_data$wave)
+mem_im_data <- mem_im_data %>% filter(wave != "Phase4")
+# scale continuois columns
+cols <- c("age2", "month_dif", "month_dif_sq", "num_years_edu")
+mem_im_data <- mem_im_data %>%
+  dplyr::mutate(across(all_of(cols), ~ as.numeric(scale(.))))
+# models
+model_mem1 <- lmerTest::lmer(story_memory_immediate_score ~ covid_group * wave + age2 + sex + month_dif + month_dif_sq + num_years_edu + eth2 + (1 | CC.ID), data = mem_im_data)
+summary(model_mem1)
+mem1_stand <- as.data.frame(standardize_parameters(model_mem1))
+
+model_mem2 <- lmerTest::lmer(story_memory_delayed_score ~ covid_group * wave + age2 + sex + month_dif + month_dif_sq + num_years_edu + eth2 + (1 | CC.ID), data = mem_im_data)
+summary(model_mem2)
+mem2_stand <- as.data.frame(standardize_parameters(model_mem2))
+
+
+# residuals check
+plot(resid(model_mem1))
+plot(resid(model_mem2))
+qqnorm(resid(model_mem1))
+qqnorm(resid(model_mem2))
+```
+#plots
+
+```{r}
+dfwc <- summarySEwithin(mem_im_data,
+  measurevar = "story_memory_immediate_score", withinvars = "wave", betweenvars = "covid_group",
+  idvar = "CC.ID", na.rm = TRUE, conf.interval = .95
+)
+
+
+ggplot(dfwc, aes(x = wave, y = story_memory_immediate_score, group = covid_group, color = covid_group)) +
+  geom_point(size = 4) +
+  geom_line(size = 2) +
+  geom_errorbar(aes(ymin = story_memory_immediate_score - se, ymax = story_memory_immediate_score + se), width = .1, size = 2) +
+  theme_bw() +
+  labs(title = "Mean scores for instance with error bars", y = "Immediate memory score", x = "instance") +
+  theme_cowplot(12) +
+  theme(
+    plot.title = element_blank(),
+    axis.title = element_text(size = 20, face = "bold"), # originally 18 → now 20
+    axis.text.x = element_text(size = 19), # originally 17 → now 19
+    axis.text.y = element_text(size = 19),
+    legend.title = element_text(size = 18, face = "bold"), # scale up from 16
+    legend.text = element_text(size = 17), # scale up from 15
+    strip.text = element_text(size = 18) # if using facet_wrap
+  ) +
+  scale_x_discrete(labels = c("T1", "T3")) +
+  scale_color_manual(values = c("#999999", "#E69F00"), labels = c("Control group", "Covid group"), name = "Group")
+
+
+dfwc <- summarySEwithin(mem_im_data,
+  measurevar = "story_memory_delayed_score", withinvars = "wave", betweenvars = "covid_group",
+  idvar = "CC.ID", na.rm = TRUE, conf.interval = .95
+)
+
+
+ggplot(dfwc, aes(x = wave, y = story_memory_delayed_score, group = covid_group, color = covid_group)) +
+  geom_point(size = 4) +
+  geom_line(size = 2) +
+  geom_errorbar(aes(ymin = story_memory_delayed_score - se, ymax = story_memory_delayed_score + se), width = .1, size = 2) +
+  theme_bw() +
+  labs(title = "Mean scores for instance with error bars", y = "Delayed memory score", x = "instance") +
+  theme_cowplot(12) +
+  theme(
+    plot.title = element_blank(),
+    axis.title = element_text(size = 20, face = "bold"), # originally 18 → now 20
+    axis.text.x = element_text(size = 19), # originally 17 → now 19
+    axis.text.y = element_text(size = 19),
+    legend.title = element_text(size = 18, face = "bold"), # scale up from 16
+    legend.text = element_text(size = 17), # scale up from 15
+    strip.text = element_text(size = 18) # if using facet_wrap
+  ) +
+  scale_x_discrete(labels = c("T1", "T3")) +
+  scale_color_manual(values = c("#999999", "#E69F00"), labels = c("Control group", "Covid group"), name = "Group")
+```
+#plots
+```{r}
+ggplot(mem_im_data, aes(x = wave, y = story_memory_delayed_score, color = covid_group)) +
+  geom_boxplot(size = 1) +
+  labs(title = "Mean scores for instance with error bars", y = "Delayed memory score", x = "instance") +
+  theme_cowplot(12) +
+  theme(
+    plot.title = element_blank(),
+    axis.title = element_text(size = 20, face = "bold"), # originally 18 → now 20
+    axis.text.x = element_text(size = 19), # originally 17 → now 19
+    axis.text.y = element_text(size = 19),
+    legend.title = element_text(size = 18, face = "bold"), # scale up from 16
+    legend.text = element_text(size = 17), # scale up from 15
+    strip.text = element_text(size = 18) # if using facet_wrap
+  ) +
+  scale_x_discrete(labels = c("T1", "T3")) +
+  scale_color_manual(values = c("#999999", "#E69F00"), labels = c("Control group", "Covid group"), name = "Group")
+
+ggplot(mem_im_data, aes(x = wave, y = story_memory_immediate_score, color = covid_group)) +
+  geom_boxplot(size = 1) +
+  labs(title = "Mean scores for instance with error bars", y = "Immediate memory score", x = "instance") +
+  theme_cowplot(12) +
+  theme(
+    plot.title = element_blank(),
+    axis.title = element_text(size = 20, face = "bold"), # originally 18 → now 20
+    axis.text.x = element_text(size = 19), # originally 17 → now 19
+    axis.text.y = element_text(size = 19),
+    legend.title = element_text(size = 18, face = "bold"), # scale up from 16
+    legend.text = element_text(size = 17), # scale up from 15
+    strip.text = element_text(size = 18) # if using facet_wrap
+  ) +
+  scale_x_discrete(labels = c("T1", "T3")) +
+  scale_color_manual(values = c("#999999", "#E69F00"), labels = c("Control group", "Covid group"), name = "Group")
+```
+
+
+#ACER analysis
+```{r}
+df_A
+# subselect relevant columns
+acer_data <- df_A %>% select(CC.ID, wave, acer_score, covid_group, sex, ethnic_group, num_years_edu, acer_age, acer_date, eth2)
+dates_wide <- acer_data %>%
+  select(CC.ID, wave, acer_date) %>%
+  distinct() %>% # in case of duplicates
+  pivot_wider(
+    names_from = wave, # e.g. "Phase1/2", "Phase4", ...
+    values_from = acer_date,
+    names_prefix = "acer_date_" # columns like story_memory_date_Phase1/2
+  )
+# calculate months difs between testing
+acer_data <- acer_data %>%
+  select(-acer_date) %>%
+  left_join(dates_wide, by = "CC.ID")
+acer_data <- acer_data %>%
+  mutate(
+    d_start = as.Date(`acer_date_Phase1/2`),
+    d_end = as.Date(acer_date_Phase5),
+    month_dif = time_length(interval(d_start, d_end), "months") # fractional
+  )
+acer_data %>%
+  filter(wave == "Phase5") %>%
+  filter(covid_group == 1) %>%
+  summary()
+acer_data$month_dif_sq <- acer_data$month_dif^2
+# calculate age at T2
+acer_data <- acer_data %>%
+  dplyr::group_by(CC.ID) %>%
+  dplyr::mutate(age2 = max(acer_age, na.rm = TRUE)) %>%
+  ungroup()
+# check data types
+str(acer_data)
+acer_data$sex <- as.factor(acer_data$sex)
+acer_data$wave <- as.factor(acer_data$wave)
+acer_data <- acer_data %>% filter(wave != "Phase4")
+# scale continuous columns
+cols <- c("age2", "month_dif", "month_dif_sq", "num_years_edu")
+acer_data <- acer_data %>%
+  dplyr::mutate(across(all_of(cols), ~ as.numeric(scale(.))))
+# models
+model_acer <- lmerTest::lmer(acer_score ~ covid_group * wave + age2 + sex + month_dif + month_dif_sq + num_years_edu + eth2 + (1 | CC.ID), data = acer_data)
+summary(model_acer)
+acer_stand <- standardize_parameters(model_acer)
+
+# checking residuals
+plot(resid(model_acer))
+plot(qqnorm(resid(model_acer)))
+```
+# plots
+```{r}
+dfwc <- summarySEwithin(acer_data,
+  measurevar = "acer_score", withinvars = "wave", betweenvars = "covid_group",
+  idvar = "CC.ID", na.rm = TRUE, conf.interval = .95
+)
+
+
+ggplot(dfwc, aes(x = wave, y = acer_score, group = covid_group, color = covid_group)) +
+  geom_point(size = 4) +
+  geom_line(size = 2) +
+  geom_errorbar(aes(ymin = acer_score - se, ymax = acer_score + se), width = .1, size = 2) +
+  theme_bw() +
+  labs(title = "Mean scores for instance with error bars", y = "ACER score", x = "instance") +
+  theme_cowplot(12) +
+  theme(
+    plot.title = element_blank(),
+    axis.title = element_text(size = 20, face = "bold"), # originally 18 → now 20
+    axis.text.x = element_text(size = 19), # originally 17 → now 19
+    axis.text.y = element_text(size = 19),
+    legend.title = element_text(size = 18, face = "bold"), # scale up from 16
+    legend.text = element_text(size = 17), # scale up from 15
+    strip.text = element_text(size = 18) # if using facet_wrap
+  ) +
+  scale_x_discrete(labels = c("T1", "T3")) +
+  scale_color_manual(values = c("#999999", "#E69F00"), labels = c("Control group", "Covid group"), name = "Group")
+```
+
+#boxplots
+```{r}
+ggplot(acer_data, aes(x = wave, y = acer_score, color = covid_group)) +
+  geom_boxplot(size = 1) +
+  labs(title = "Mean scores for instance with error bars", y = "ACE-R score", x = "instance") +
+  theme_cowplot(12) +
+  theme(
+    plot.title = element_blank(),
+    axis.title = element_text(size = 20, face = "bold"), # originally 18 → now 20
+    axis.text.x = element_text(size = 19), # originally 17 → now 19
+    axis.text.y = element_text(size = 19),
+    legend.title = element_text(size = 18, face = "bold"), # scale up from 16
+    legend.text = element_text(size = 17), # scale up from 15
+    strip.text = element_text(size = 18) # if using facet_wrap
+  ) +
+  scale_x_discrete(labels = c("T1", "T3")) +
+  scale_color_manual(values = c("#999999", "#E69F00"), labels = c("Control group", "Covid group"), name = "Group")
+```
+
+# Cattel analysis
+```{r}
+# subselect relevant columns
+cattell_data <- df_A %>% select(CC.ID, wave, cattell_total_score, covid_group, sex, ethnic_group, num_years_edu, cattell_age, cattell_date, eth2)
+
+dates_wide <- cattell_data %>%
+  select(CC.ID, wave, cattell_date) %>%
+  distinct() %>% # in case of duplicates
+  pivot_wider(
+    names_from = wave, # e.g. "Phase1/2", "Phase4", ...
+    values_from = cattell_date,
+    names_prefix = "cattell_date_" # columns like story_memory_date_Phase1/2
+  )
+# calculate months difs between testing
+cattell_data <- cattell_data %>%
+  select(-cattell_date) %>%
+  left_join(dates_wide, by = "CC.ID")
+cattell_data <- cattell_data %>%
+  mutate(
+    d_start = as.Date(`cattell_date_Phase1/2`),
+    d_middle = as.Date(cattell_date_Phase4),
+    d_end = as.Date(cattell_date_Phase5),
+    month_dif1 = time_length(interval(d_start, d_end), "months"),
+    month_dif2 = time_length(interval(d_middle, d_end), "months") # fractional
+  )
+
+cattell_data %>%
+  filter(wave == "Phase5") %>%
+  filter(covid_group == 0) %>%
+  summary()
+
+
+summary(cattell_data$month_dif1, na.rm = TRUE)
+summary(cattell_data$month_dif2, na.rm = TRUE)
+
+cattell_data$month_dif1_sq <- cattell_data$month_dif1^2
+cattell_data$month_dif2_sq <- cattell_data$month_dif2^2
+# calculate age at T2
+cattell_data$age2 <- ave(cattell_data$cattell_age, cattell_data$CC.ID,
+  FUN = function(x) if (all(is.na(x))) NA_real_ else max(x, na.rm = TRUE)
+)
+# check data types
+str(cattell_data)
+cattell_data$sex <- as.factor(cattell_data$sex)
+cattell_data$wave <- as.factor(cattell_data$wave)
+
+# scale continuois columns
+cols <- c("age2", "month_dif1", "month_dif1_sq", "month_dif2", "month_dif2_sq", "num_years_edu")
+cattell_data <- cattell_data %>% dplyr::mutate(across(all_of(cols), ~ as.numeric(scale(.))))
+# cattell_data$age2 <- scale(cattell_data$age2, center = TRUE, scale=TRUE)
+
+contrasts(cattell_data$wave)
+
+dfwc <- summarySEwithin(cattell_data,
+  measurevar = "cattell_total_score", withinvars = "wave", betweenvars = "covid_group",
+  idvar = "CC.ID", na.rm = TRUE, conf.interval = .95
+)
+
+
+ggplot(dfwc, aes(x = wave, y = cattell_total_score, group = covid_group, color = covid_group)) +
+  geom_point(size = 4) +
+  geom_line(size = 2) +
+  geom_errorbar(aes(ymin = cattell_total_score - se, ymax = cattell_total_score + se), width = .1, size = 2) +
+  theme_bw() +
+  labs(title = "Mean scores for instance with error bars", y = "Cattell score", x = "instance") +
+  theme_cowplot(12) +
+  theme(
+    plot.title = element_blank(),
+    axis.title = element_text(size = 20, face = "bold"), # originally 18 → now 20
+    axis.text.x = element_text(size = 19), # originally 17 → now 19
+    axis.text.y = element_text(size = 19),
+    legend.title = element_text(size = 18, face = "bold"), # scale up from 16
+    legend.text = element_text(size = 17), # scale up from 15
+    strip.text = element_text(size = 18) # if using facet_wrap
+  ) +
+  scale_color_manual(values = c("#999999", "#E69F00"), labels = c("Control group", "Covid group"), name = "Group") +
+  scale_x_discrete(labels = c("T1", "T2", "T3"))
+
+cattell_data$wave <- factor(cattell_data$wave,
+  levels = c("Phase1/2", "Phase4", "Phase5")
+)
+# dividing into 2 models
+
+cattell_data1 <- cattell_data %>% filter(wave != "Phase4")
+summary(cattell_data1)
+# model1
+model_cattell1 <- lmerTest::lmer(cattell_total_score ~ covid_group * wave + age2 + sex + month_dif1 + month_dif1_sq + num_years_edu + eth2 + (1 | CC.ID), data = cattell_data1)
+summary(model_cattell1)
+standardize_parameters(model_cattell1)
+cattell1_stand <- as.data.frame(standardize_parameters(model_cattell1))
+cattell_data2 <- cattell_data %>% filter(wave != "Phase1/2")
+# model2
+model_cattell2 <- lmerTest::lmer(cattell_total_score ~ covid_group * wave + age2 + sex + month_dif2 + month_dif2_sq + num_years_edu + eth2 + (1 | CC.ID), data = cattell_data2)
+summary(model_cattell2)
+cattell2_stand <- as.data.frame(standardize_parameters(model_cattell2))
+# checking residuals
+plot(resid(model_cattell1))
+plot(qqnorm(resid(model_cattell1)))
+plot(resid(model_cattell2))
+plot(qqnorm(resid(model_cattell2)))
+```
+#boxplot
+```{r}
+ggplot(cattell_data, aes(x = wave, y = cattell_total_score, color = covid_group)) +
+  geom_boxplot(size = 1) +
+  labs(title = "Mean scores for instance with error bars", y = "Cattell score", x = "instance") +
+  theme_cowplot(12) +
+  theme(
+    plot.title = element_blank(),
+    axis.title = element_text(size = 20, face = "bold"), # originally 18 → now 20
+    axis.text.x = element_text(size = 19), # originally 17 → now 19
+    axis.text.y = element_text(size = 19),
+    legend.title = element_text(size = 18, face = "bold"), # scale up from 16
+    legend.text = element_text(size = 17), # scale up from 15
+    strip.text = element_text(size = 18) # if using facet_wrap
+  ) +
+  scale_x_discrete(labels = c("T1", "T2", "T3")) +
+  scale_color_manual(values = c("#999999", "#E69F00"), labels = c("Control group", "Covid group"), name = "Group")
+```
+#stw analysis
+```{r}
+# subselect relevant columns
+stw_data <- df_A %>% select(CC.ID, wave, stw_n_correct_trials, covid_group, sex, ethnic_group, num_years_edu, stw_age, stw_date, eth2)
+
+dates_wide <- stw_data %>%
+  select(CC.ID, wave, stw_date) %>%
+  distinct() %>% # in case of duplicates
+  pivot_wider(
+    names_from = wave, # e.g. "Phase1/2", "Phase4", ...
+    values_from = stw_date,
+    names_prefix = "stw_date_" # columns like story_memory_date_Phase1/2
+  )
+# calculate months difs between testing
+stw_data <- stw_data %>%
+  select(-stw_date) %>%
+  left_join(dates_wide, by = "CC.ID")
+stw_data <- stw_data %>%
+  mutate(
+    d_start = as.Date(`stw_date_Phase1/2`),
+    d_middle = as.Date(stw_date_Phase4),
+    d_end = as.Date(stw_date_Phase5),
+    month_dif1 = time_length(interval(d_start, d_end), "months"),
+    month_dif2 = time_length(interval(d_middle, d_end), "months")
+  )
+
+stw_data %>%
+  filter(wave == "Phase5") %>%
+  filter(covid_group == 0) %>%
+  summary()
+
+summary(stw_data$month_dif1, na.rm = TRUE)
+summary(stw_data$month_dif2, na.rm = TRUE)
+
+stw_data$month_dif1_sq <- stw_data$month_dif1^2
+stw_data$month_dif2_sq <- stw_data$month_dif2^2
+# calculate age at T2
+stw_data$age2 <- ave(stw_data$stw_age, stw_data$CC.ID,
+  FUN = function(x) if (all(is.na(x))) NA_real_ else max(x, na.rm = TRUE)
+)
+# check data types
+str(stw_data)
+stw_data$sex <- as.factor(cattell_data$sex)
+stw_data$wave <- as.factor(cattell_data$wave)
+
+# scale continuois columns
+cols <- c("age2", "month_dif1", "month_dif1_sq", "month_dif2", "month_dif2_sq", "num_years_edu")
+stw_data <- stw_data %>%
+  dplyr::mutate(across(all_of(cols), ~ as.numeric(scale(.))))
+
+contrasts(stw_data$wave)
+
+dfwc <- summarySEwithin(stw_data,
+  measurevar = "stw_n_correct_trials", withinvars = "wave", betweenvars = "covid_group",
+  idvar = "CC.ID", na.rm = TRUE, conf.interval = .95
+)
+
+
+ggplot(dfwc, aes(x = wave, y = stw_n_correct_trials, group = covid_group, color = covid_group)) +
+  geom_point(size = 4) +
+  geom_line(size = 2) +
+  geom_errorbar(aes(ymin = stw_n_correct_trials - se, ymax = stw_n_correct_trials + se), width = .1, size = 2) +
+  theme_bw() +
+  labs(title = "Mean scores for instance with error bars", y = "Stw score", x = "instance") +
+  theme_cowplot(12) +
+  theme(
+    plot.title = element_blank(),
+    axis.title = element_text(size = 20, face = "bold"), # originally 18 → now 20
+    axis.text.x = element_text(size = 19), # originally 17 → now 19
+    axis.text.y = element_text(size = 19),
+    legend.title = element_text(size = 18, face = "bold"), # scale up from 16
+    legend.text = element_text(size = 17), # scale up from 15
+    strip.text = element_text(size = 18) # if using facet_wrap
+  ) +
+  scale_color_manual(values = c("#999999", "#E69F00"), labels = c("Control group", "Covid group")) +
+  scale_x_discrete(labels = c("T1", "T2", "T3"))
+
+stw_data$wave <- factor(stw_data$wave,
+  levels = c("Phase1/2", "Phase4", "Phase5")
+)
+# dividing into 2 models
+
+stw_data1 <- stw_data %>% filter(wave != "Phase4")
+
+# model1
+model_stw1 <- lmerTest::lmer(stw_n_correct_trials ~ covid_group * wave + age2 + sex + month_dif1 + month_dif1_sq + num_years_edu + eth2 + (1 | CC.ID), data = stw_data1)
+summary(model_stw1)
+standardize_parameters(model_stw1)
+stw1_stand <- as.data.frame(standardize_parameters(model_stw1))
+stw_data2 <- stw_data %>% filter(wave != "Phase1/2")
+# model2
+model_stw2 <- lmerTest::lmer(stw_n_correct_trials ~ covid_group * wave + age2 + sex + month_dif2 + month_dif2_sq + num_years_edu + eth2 + (1 | CC.ID), data = stw_data2)
+summary(model_stw2)
+standardize_parameters(model_stw2)
+stw2_stand <- as.data.frame(standardize_parameters(model_stw2))
+
+
+plot(resid(model_stw1))
+plot(qqnorm(resid(model_stw1)))
+plot(resid(model_stw2))
+plot(qqnorm(resid(model_stw2)))
+```
+# correction for multiple comprisons - putting models together
+```{r}
+models <- list(model_mem1, model_mem2, model_acer, model_cattell1, model_cattell2, model_stw1, model_stw2)
+model_names <- c("memory1", "memory2", "acer", "cattell1", "cattell2", "stw1", "stw2")  
+
+
+# Extract fixed effects from all models
+model_results <- lapply(seq_along(models), function(i) {
+  mod <- models[[i]]
+  res <- tidy(mod, effects = "fixed")
+  res$model <- model_names[i]
+  return(res)
+})
+
+# Combine all into one data frame
+all_pvals <- do.call(rbind, model_results)
+all_pvals
+```
+
+# correction for multiple comparisons - applying FDR
+```{r}
+fdr_pvals <- all_pvals %>%
+  mutate(p_fdr = p.adjust(p.value, method = "fdr")) %>%
+  ungroup()
+options(scipen = 999)
+fdr_pvals
+
+
+fdr_pvals %>%
+  filter(p_fdr <= 0.05) %>%
+  select(term, model, p_fdr)
+#summary file of all results
+#write.xlsx(fdr_pvals,"ukb_cog_fdr.csv")
+```
+# descriptives
+```{r}
+df_A %>%
+  group_by(wave, covid_group) %>%
+  dplyr::summarise(
+    dplyr::across(
+      .cols = where(is.numeric) & !any_of(c("wave", "covid_group")),
+      .fns = list(
+        mean = ~ mean(.x, na.rm = TRUE),
+        se   = ~ sd(.x, na.rm = TRUE) / sqrt(sum(!is.na(.x)))
+      ),
+      .names = "{.col}_{.fn}"
+    ),
+    .groups = "drop"
+  )
+
+dates <- demo %>%
+  pivot_longer(
+    cols = ends_with("_date"), # or: matches("_date$")
+    names_to = "variable",
+    values_to = "dates",
+    values_drop_na = TRUE # optional: drop rows where dates are NA
+  )
+
+
+ggplot(dates, aes(x = dates, y = variable, colour = wave)) +
+  geom_line() +
+  theme_cowplot(12) +
+  theme(
+    plot.title = element_blank(),
+    axis.title = element_text(size = 20, face = "bold"), # originally 18 → now 20
+    axis.text.x = element_text(size = 19), # originally 17 → now 19
+    axis.text.y = element_text(size = 19),
+    legend.title = element_text(size = 18, face = "bold"), # scale up from 16
+    legend.text = element_text(size = 17), # scale up from 15
+    strip.text = element_text(size = 18) # if using facet_wrap
+  ) +
+  scale_color_manual(values = palette.colors(), labels = c("instance 1", "instance 2", "instance 3"))
+
+
+cols <- c("stw_age", "acer_age", "story_memory_age", "cattell_age")
+
+demo$age_sum <- rowSums(demo[cols], na.rm = TRUE)
+demo$age_n <- rowSums(!is.na(demo[cols]))
+demo$age_mean <- ifelse(demo$age_n > 0, demo$age_sum / demo$age_n, NA_real_)
+demo$sex <- as.factor(demo$sex)
+demo %>%
+  filter(wave == "Phase5") %>%
+  filter(covid_group == 1) %>%
+  summary()
+demo %>%
+  filter(wave == "Phase1/2") %>%
+  summary()
+str(demo$sex)
+df_A$eth2 <- as.factor(df_A$eth2)
+df_A %>%
+  filter(wave == "Phase5") %>%
+  filter(covid_group == 0) %>%
+  summary()
+```
+#results from other predictors table
+```{r}
+
+# Making sure list has names matching the object names
+stand_mod <- list(
+  mem1_stand      = mem1_stand,
+  mem2_stand      = mem2_stand,
+  acer_stand      = acer_stand,
+  cattell1_stand  = cattell1_stand,
+  cattell2_stand  = cattell2_stand,
+  stw1_stand      = stw1_stand,
+  stw2_stand      = stw2_stand
+)
+
+# Helper to format one df into: Parameter + "<dfname>" column
+format_one <- function(df, nm) {
+  df %>%
+    transmute(
+      Parameter,
+      !!nm := sprintf("%.3f [%.3f, %.3f]", Std_Coefficient, CI_low, CI_high)
+    )
+}
+
+# Apply to each df and join them wide by Parameter
+formatted_list <- imap(stand_mod, format_one)
+
+coef_wide <- reduce(formatted_list, full_join, by = "Parameter")
+
+# View
+coef_wide
+
+#write_csv(coef_wide, "camcan_otherpred.csv")
+```
