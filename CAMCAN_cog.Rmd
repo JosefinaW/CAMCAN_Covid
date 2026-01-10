@@ -697,7 +697,7 @@ fdr_pvals %>%
   filter(p_fdr <= 0.05) %>%
   select(term, model, p_fdr)
 #summary file of all results
-#write.xlsx(fdr_pvals,"ukb_cog_fdr.csv")
+write.xlsx(fdr_pvals,"camcan_results.xlsx")
 ```
 # descriptives
 ```{r}
